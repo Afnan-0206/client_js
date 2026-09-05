@@ -631,10 +631,22 @@ aggregation method, set the `aggregator` property in the metric config to one of
 for an example.)
 
 Failed cluster collections are recorded in the
-`prom_client_cluster_worker_scrape_failures` histogram. Each observation is the
-number of workers that failed to return metrics. Since failed collections reject
-without returning partial metrics, the observation is exposed by the next
-successful call to `clusterMetrics()`.
+`prom_client_cluster_worker_scrape_failures` histogram. Worker thread collections
+use `prom_client_worker_scrape_failures`. Each failed collection records one
+observation: the number of outstanding worker responses on a timeout, or the
+number of worker-reported errors received before the collection rejects. Other
+collection errors record zero when no worker failures are known. Successful
+collections do not add observations.
+
+Failed collections reject without returning partial metrics. Their observations
+are exposed by subsequent successful calls to `clusterMetrics()` or
+`workerMetrics()`, respectively, even if there are no workers left. These internal
+histograms are registered in the global registry when their corresponding
+`ClusterRegistry` or `WorkerRegistry` is constructed. Aggregation also includes
+the coordinating process or thread's metrics. If custom registries selected with
+`setRegistries()` do not contain the internal histogram, it is included separately
+so failure observations remain available without duplicating it in the default
+registry path.
 
 If you need to expose metrics about an individual worker, you can include a
 value that is unique to the worker (such as the worker ID or process ID) in a

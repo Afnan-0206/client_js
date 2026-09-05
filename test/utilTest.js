@@ -56,6 +56,21 @@ describe('utils', () => {
 			await expect(waitFor(Promise.resolve('foo'))).resolves.toEqual('foo');
 		});
 
+		it('rejects with the supplied error when the deadline expires', async () => {
+			const timeoutError = new Error('Timeout');
+			await expect(
+				waitFor(new Promise(() => {}), 1, timeoutError),
+			).rejects.toBe(timeoutError);
+		});
+
+		it('preserves a promise rejection with the same message as the deadline', async () => {
+			const timeoutError = new Error('Timeout');
+			const collectorError = new Error('Timeout');
+			await expect(
+				waitFor(Promise.reject(collectorError), 5_000, timeoutError),
+			).rejects.toBe(collectorError);
+		});
+
 		it('Rejects on a promise rejection', async () => {
 			const promise = waitFor(Promise.reject(new Error('nope')));
 			await expect(promise).rejects.toThrow('nope');

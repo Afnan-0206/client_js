@@ -293,6 +293,113 @@ describe.each([
 			}
 		});
 
+		it.each(['default', 'custom', 'custom with internal histogram'])(
+			'records zero for a %s registry failure without workers and exports it once',
+			async registryType => {
+				const MetricRegistry = require('../lib/registry');
+				const source =
+					registryType === 'default'
+						? MetricRegistry.globalRegistry
+						: new MetricRegistry();
+				AggregatorRegistry.setRegistries(source);
+				const registry = new AggregatorRegistry(regType);
+				const histogram = MetricRegistry.globalRegistry.getSingleMetric(
+					CLUSTER_WORKER_SCRAPE_FAILURES,
+				);
+				expect(histogram).toBeDefined();
+				if (registryType === 'custom with internal histogram') {
+					source.registerMetric(histogram);
+				}
+				const error = new TypeError('Timeout');
+				jest.spyOn(source, 'getMetricsAsJSON').mockRejectedValueOnce(error);
+
+				await expect(registry.clusterMetrics()).rejects.toBe(error);
+
+				for (let scrape = 0; scrape < 2; scrape++) {
+					const metrics = await registry.clusterMetrics();
+					expect(
+						metrics
+							.split('\n')
+							.filter(line =>
+								line.startsWith(`${CLUSTER_WORKER_SCRAPE_FAILURES}_count `),
+							),
+					).toEqual([`${CLUSTER_WORKER_SCRAPE_FAILURES}_count 1`]);
+					expect(metrics).toContain(
+						`${CLUSTER_WORKER_SCRAPE_FAILURES}_sum 0\n`,
+					);
+					expect(metrics).toContain(
+						`${CLUSTER_WORKER_SCRAPE_FAILURES}_bucket{le="0"} 1\n`,
+					);
+				}
+
+				MetricRegistry.globalRegistry.resetMetrics();
+				expect((await histogram.get()).values).toEqual([]);
+				source.getMetricsAsJSON.mockRejectedValueOnce(error);
+				await expect(registry.clusterMetrics()).rejects.toBe(error);
+				await expect(registry.clusterMetrics()).resolves.toContain(
+					`${CLUSTER_WORKER_SCRAPE_FAILURES}_count 1\n`,
+				);
+			},
+		);
+
+		it('does not count waiting workers when a worker reports an error named Timeout', async () => {
+			jest.useFakeTimers();
+			const registry = new AggregatorRegistry(regType);
+			const workers = [1, 2].map(id => {
+				return { id, isConnected: () => true, send: jest.fn() };
+			});
+			for (const worker of workers) {
+				cluster.emit('message', worker, { type: ANNOUNCEMENT });
+			}
+
+			try {
+				const rejected = expect(registry.clusterMetrics()).rejects.toThrow(
+					/^Timeout$/,
+				);
+				cluster.emit('message', workers[0], {
+					type: GET_METRICS_RES,
+					requestId: 0,
+					error: 'Timeout',
+				});
+				await rejected;
+				await jest.advanceTimersByTimeAsync(0);
+				expect(jest.getTimerCount()).toBe(0);
+			} finally {
+				for (const worker of workers) cluster.emit('disconnect', worker);
+			}
+
+			const metrics = await registry.clusterMetrics();
+			expect(metrics).toContain(`${CLUSTER_WORKER_SCRAPE_FAILURES}_count 1\n`);
+			expect(metrics).toContain(`${CLUSTER_WORKER_SCRAPE_FAILURES}_sum 1\n`);
+		});
+
+		it('records synchronous send failures and settles the pending request', async () => {
+			jest.useFakeTimers();
+			const registry = new AggregatorRegistry(regType);
+			const error = new TypeError('worker.send failed');
+			const worker = {
+				id: 1,
+				isConnected: () => true,
+				send: jest.fn(() => {
+					throw error;
+				}),
+			};
+			cluster.emit('message', worker, { type: ANNOUNCEMENT });
+
+			try {
+				await expect(registry.clusterMetrics()).rejects.toBe(error);
+				await jest.advanceTimersByTimeAsync(0);
+				expect(jest.getTimerCount()).toBe(0);
+				await expect(registry.shutdown()).resolves.toBeUndefined();
+			} finally {
+				cluster.emit('disconnect', worker);
+			}
+
+			const metrics = await registry.clusterMetrics();
+			expect(metrics).toContain(`${CLUSTER_WORKER_SCRAPE_FAILURES}_count 1\n`);
+			expect(metrics).toContain(`${CLUSTER_WORKER_SCRAPE_FAILURES}_sum 0\n`);
+		});
+
 		it('accumulate stats from terminated workers', async () => {
 			const originalWorkers = cluster.workers;
 			const registry = new AggregatorRegistry(regType);
@@ -443,7 +550,12 @@ describe.each([
 					],
 				};
 
-				await expect(metrics).resolves.toEqual([[expected]]);
+				const histogram = AggregatorRegistry.globalRegistry.getSingleMetric(
+					CLUSTER_WORKER_SCRAPE_FAILURES,
+				);
+				await expect(metrics).resolves.toEqual([
+					[await histogram.get(), expected],
+				]);
 			} finally {
 				jest.dontMock('cluster');
 				gauge.remove();
