@@ -19,10 +19,11 @@ const { getLabelNames, labelCombinationFactory } = require('./utils/labels');
 module.exports = setupGaugeSuite;
 
 function setupGaugeSuite(suite) {
-	suite.add('inc', (client, { Gauge }) => Gauge.inc(1), {
-		teardown,
-		setup: setup(0),
-	});
+	suite.add(
+		'inc',
+		labelCombinationFactory([8, 8], (client, { Gauge }) => Gauge.inc(1)),
+		{ teardown, setup: setup(0) },
+	);
 
 	suite.add(
 		'inc with labels',
