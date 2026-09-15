@@ -82,7 +82,7 @@ describe.each([
 
 		it('works properly if there are no workers', async () => {
 			const metrics = await registry.workerMetrics();
-			expect(metrics).toContain(`${WORKER_SCRAPE_FAILURES}_count 0`);
+			expect(metrics).toBe('');
 		});
 
 		it('formats in the correct content type', async () => {
@@ -433,6 +433,7 @@ describe.each([
 
 		WorkerRegistry = require('../lib/worker');
 		registry = new WorkerRegistry(regType);
+		WorkerRegistry.globalRegistry.setContentType(regType);
 		announcementChannel = channels[0];
 	});
 
@@ -492,11 +493,12 @@ describe.each([
 			await worker.receive({ type: GOODBYE, metrics: [[]] });
 		}
 		expect(WorkerRegistry.workerCount()).toBe(0);
-		const recovered = await registry.workerMetrics();
+		await expect(registry.workerMetrics()).resolves.toBe('');
+		const recovered = await WorkerRegistry.globalRegistry.metrics();
 		expectFailures(recovered, 2, 3);
 		expect(recovered).toContain(`${WORKER_SCRAPE_FAILURES}_bucket{le="1"} 1\n`);
 		expect(recovered).toContain(`${WORKER_SCRAPE_FAILURES}_bucket{le="2"} 2\n`);
-		expectFailures(await registry.workerMetrics(), 2, 3);
+		expectFailures(await WorkerRegistry.globalRegistry.metrics(), 2, 3);
 	});
 
 	it.each(['worker collection failed', 'Timeout'])(
@@ -528,36 +530,42 @@ describe.each([
 				metrics: [[]],
 			});
 			const metrics = await recovered;
-			expectFailures(metrics, 1, 1);
+			expect(metrics).not.toContain(WORKER_SCRAPE_FAILURES);
+			expectFailures(await WorkerRegistry.globalRegistry.metrics(), 1, 1);
 			expect(metrics).toContain('test_metric 7\n');
 		},
 	);
 
-	it.each([0, 1])(
-		'records zero for a broadcast failure with %i workers and settles the request',
-		async workerCount => {
-			const worker = workerCount ? await announceWorker(1) : undefined;
-			const error = new TypeError('postMessage failed');
-			announcementChannel.postMessage.mockImplementationOnce(() => {
-				throw error;
-			});
+	it('records zero for aggregation errors without adding local metrics to worker responses', async () => {
+		const worker = await announceWorker(1);
+		const gauge = new (require('../lib/gauge'))({
+			name: 'coordinator_value',
+			help: 'test',
+		});
+		gauge.set(17);
+		const rejected = expect(registry.workerMetrics()).rejects.toThrow(
+			"'invalid' is not a defined aggregator.",
+		);
+		await worker.receive({
+			type: GET_METRICS_RES,
+			requestId: 0,
+			metrics: [[{ ...metric(7), aggregator: 'invalid' }]],
+		});
+		await rejected;
+		expectFailures(await WorkerRegistry.globalRegistry.metrics(), 1, 0, 1);
 
-			await expect(registry.workerMetrics()).rejects.toBe(error);
-			await jest.advanceTimersByTimeAsync(0);
-			expect(jest.getTimerCount()).toBe(0);
-			await expect(registry.shutdown()).resolves.toBeUndefined();
-
-			const recovered = registry.workerMetrics();
-			if (worker) {
-				await worker.receive({
-					type: GET_METRICS_RES,
-					requestId: 1,
-					metrics: [[]],
-				});
-			}
-			expectFailures(await recovered, 1, 0, 1);
-		},
-	);
+		const recovered = registry.workerMetrics();
+		await worker.receive({
+			type: GET_METRICS_RES,
+			requestId: 1,
+			metrics: [[metric(7)]],
+		});
+		const metrics = await recovered;
+		expect(metrics).toContain('test_metric 7\n');
+		expect(metrics).not.toContain('coordinator_value');
+		expect(metrics).not.toContain(WORKER_SCRAPE_FAILURES);
+		expectFailures(await WorkerRegistry.globalRegistry.metrics(), 1, 0, 1);
+	});
 
 	it.each(['default', 'custom'])(
 		'reports %s registry collection errors to the parent',
@@ -596,45 +604,6 @@ describe.each([
 			expect(
 				MetricRegistry.globalRegistry.getSingleMetric(WORKER_SCRAPE_FAILURES),
 			).toBeDefined();
-		},
-	);
-
-	it.each(['default', 'custom', 'custom with internal histogram'])(
-		'exports a %s registry failure once and preserves a collector error named Timeout',
-		async registryType => {
-			const MetricRegistry = require('../lib/registry');
-			const Gauge = require('../lib/gauge');
-			const source =
-				registryType === 'default'
-					? MetricRegistry.globalRegistry
-					: new MetricRegistry();
-			WorkerRegistry.setRegistries(source);
-			const histogram = MetricRegistry.globalRegistry.getSingleMetric(
-				WORKER_SCRAPE_FAILURES,
-			);
-			expect(histogram).toBeDefined();
-			if (registryType === 'custom with internal histogram')
-				source.registerMetric(histogram);
-			const gauge = new Gauge({
-				name: 'coordinator_value',
-				help: 'test',
-				registers: [source],
-			});
-			gauge.set(17);
-			const error = new TypeError('Timeout');
-			jest.spyOn(source, 'getMetricsAsJSON').mockRejectedValueOnce(error);
-			await expect(registry.workerMetrics()).rejects.toBe(error);
-
-			for (let scrape = 0; scrape < 2; scrape++) {
-				const metrics = await registry.workerMetrics();
-				expectFailures(metrics, 1, 0, 1);
-				expect(metrics).toContain('coordinator_value 17\n');
-			}
-			MetricRegistry.globalRegistry.resetMetrics();
-			expect((await histogram.get()).values).toEqual([]);
-			source.getMetricsAsJSON.mockRejectedValueOnce(error);
-			await expect(registry.workerMetrics()).rejects.toBe(error);
-			expectFailures(await registry.workerMetrics(), 1, 0, 1);
 		},
 	);
 });

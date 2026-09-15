@@ -638,15 +638,14 @@ number of worker-reported errors received before the collection rejects. Other
 collection errors record zero when no worker failures are known. Successful
 collections do not add observations.
 
-Failed collections reject without returning partial metrics. Their observations
-are exposed by subsequent successful calls to `clusterMetrics()` or
-`workerMetrics()`, respectively, even if there are no workers left. These internal
+Failed collections reject without returning partial metrics. These internal
 histograms are registered in the global registry when their corresponding
-`ClusterRegistry` or `WorkerRegistry` is constructed. Aggregation also includes
-the coordinating process or thread's metrics. If custom registries selected with
-`setRegistries()` do not contain the internal histogram, it is included separately
-so failure observations remain available without duplicating it in the default
-registry path.
+`ClusterRegistry` or `WorkerRegistry` is constructed. Read the coordinating
+process or thread's failure observations through `register.metrics()`.
+`clusterMetrics()` also includes the coordinator's selected registries, whereas
+`workerMetrics()` retains its existing worker-only collection behavior.
+Custom registries selected with `setRegistries()` do not automatically include
+the internal histogram; register it explicitly if needed.
 
 If you need to expose metrics about an individual worker, you can include a
 value that is unique to the worker (such as the worker ID or process ID) in a

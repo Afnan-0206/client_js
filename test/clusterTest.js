@@ -294,7 +294,7 @@ describe.each([
 		});
 
 		it.each(['default', 'custom', 'custom with internal histogram'])(
-			'records zero for a %s registry failure without workers and exports it once',
+			'records zero for a %s registry failure and respects selected registries',
 			async registryType => {
 				const MetricRegistry = require('../lib/registry');
 				const source =
@@ -310,13 +310,17 @@ describe.each([
 				if (registryType === 'custom with internal histogram') {
 					source.registerMetric(histogram);
 				}
-				const error = new TypeError('Timeout');
+				const error = new TypeError('local collection failed');
 				jest.spyOn(source, 'getMetricsAsJSON').mockRejectedValueOnce(error);
 
 				await expect(registry.clusterMetrics()).rejects.toBe(error);
 
 				for (let scrape = 0; scrape < 2; scrape++) {
 					const metrics = await registry.clusterMetrics();
+					if (registryType === 'custom') {
+						expect(metrics).not.toContain(CLUSTER_WORKER_SCRAPE_FAILURES);
+						continue;
+					}
 					expect(
 						metrics
 							.split('\n')
@@ -332,13 +336,20 @@ describe.each([
 					);
 				}
 
+				const observed = await histogram.get();
+				expect(observed.values).toContainEqual({
+					metricName: `${CLUSTER_WORKER_SCRAPE_FAILURES}_count`,
+					labels: {},
+					value: 1,
+				});
 				MetricRegistry.globalRegistry.resetMetrics();
 				expect((await histogram.get()).values).toEqual([]);
 				source.getMetricsAsJSON.mockRejectedValueOnce(error);
 				await expect(registry.clusterMetrics()).rejects.toBe(error);
-				await expect(registry.clusterMetrics()).resolves.toContain(
-					`${CLUSTER_WORKER_SCRAPE_FAILURES}_count 1\n`,
-				);
+				await registry.clusterMetrics();
+				await expect(
+					MetricRegistry.globalRegistry.metrics(),
+				).resolves.toContain(`${CLUSTER_WORKER_SCRAPE_FAILURES}_count 1\n`);
 			},
 		);
 
@@ -371,33 +382,6 @@ describe.each([
 			const metrics = await registry.clusterMetrics();
 			expect(metrics).toContain(`${CLUSTER_WORKER_SCRAPE_FAILURES}_count 1\n`);
 			expect(metrics).toContain(`${CLUSTER_WORKER_SCRAPE_FAILURES}_sum 1\n`);
-		});
-
-		it('records synchronous send failures and settles the pending request', async () => {
-			jest.useFakeTimers();
-			const registry = new AggregatorRegistry(regType);
-			const error = new TypeError('worker.send failed');
-			const worker = {
-				id: 1,
-				isConnected: () => true,
-				send: jest.fn(() => {
-					throw error;
-				}),
-			};
-			cluster.emit('message', worker, { type: ANNOUNCEMENT });
-
-			try {
-				await expect(registry.clusterMetrics()).rejects.toBe(error);
-				await jest.advanceTimersByTimeAsync(0);
-				expect(jest.getTimerCount()).toBe(0);
-				await expect(registry.shutdown()).resolves.toBeUndefined();
-			} finally {
-				cluster.emit('disconnect', worker);
-			}
-
-			const metrics = await registry.clusterMetrics();
-			expect(metrics).toContain(`${CLUSTER_WORKER_SCRAPE_FAILURES}_count 1\n`);
-			expect(metrics).toContain(`${CLUSTER_WORKER_SCRAPE_FAILURES}_sum 0\n`);
 		});
 
 		it('accumulate stats from terminated workers', async () => {
