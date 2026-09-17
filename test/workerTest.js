@@ -23,6 +23,7 @@ const ANNOUNCEMENT = '@prometheus-io/client:announcement';
 const GET_METRICS_REQ = '@prometheus-io/client:getMetricsReq';
 const GET_METRICS_RES = '@prometheus-io/client:getMetricsRes';
 const GOODBYE = '@prometheus-io/client:goodbye';
+const WORKER_SCRAPE_FAILURES = 'prom_client_worker_scrape_failures';
 
 function metric(value) {
 	return {
@@ -81,7 +82,7 @@ describe.each([
 
 		it('works properly if there are no workers', async () => {
 			const metrics = await registry.workerMetrics();
-			expect(metrics).toEqual('');
+			expect(metrics).toBe('');
 		});
 
 		it('formats in the correct content type', async () => {
@@ -285,7 +286,12 @@ describe.each([
 					],
 				};
 
-				await expect(metrics).resolves.toEqual([[expected]]);
+				const histogram = AggregatorRegistry.globalRegistry.getSingleMetric(
+					WORKER_SCRAPE_FAILURES,
+				);
+				await expect(metrics).resolves.toEqual([
+					[await histogram.get(), expected],
+				]);
 			} finally {
 				channel.close();
 			}
@@ -376,4 +382,228 @@ describe.each([
 			}
 		});
 	});
+});
+
+describe.each([
+	['Prometheus', Registry.PROMETHEUS_CONTENT_TYPE],
+	['OpenMetrics', Registry.OPENMETRICS_CONTENT_TYPE],
+])('%s worker scrape failures', (tag, regType) => {
+	let WorkerRegistry;
+	let registry;
+	let channels;
+	let announcementChannel;
+
+	beforeEach(() => {
+		jest.resetModules();
+		jest.useFakeTimers();
+		channels = [];
+
+		// Deliver messages explicitly so timeout and late-response tests do not
+		// depend on BroadcastChannel scheduling or wall-clock delays.
+		jest.doMock('node:worker_threads', () => {
+			return {
+				isMainThread: true,
+				threadId: 0,
+				BroadcastChannel: class {
+					constructor(name) {
+						this.name = name;
+						this.listeners = [];
+						this.postMessage = jest.fn();
+						channels.push(this);
+					}
+
+					unref() {
+						return this;
+					}
+
+					close() {}
+
+					addEventListener(type, listener) {
+						if (type === 'message') this.listeners.push(listener);
+					}
+
+					receive(data) {
+						return Promise.all(
+							this.listeners.map(listener => listener({ data })),
+						);
+					}
+				},
+			};
+		});
+
+		WorkerRegistry = require('../lib/worker');
+		registry = new WorkerRegistry(regType);
+		WorkerRegistry.globalRegistry.setContentType(regType);
+		announcementChannel = channels[0];
+	});
+
+	afterEach(() => {
+		jest.useRealTimers();
+		jest.restoreAllMocks();
+		jest.dontMock('node:worker_threads');
+	});
+
+	async function announceWorker(threadId) {
+		const name = `@prometheus-io/client:worker:${threadId}`;
+		await announcementChannel.receive({ type: ANNOUNCEMENT, name, threadId });
+		return channels.find(channel => channel.name === name);
+	}
+
+	function expectFailures(metrics, count, sum, zeros = 0) {
+		expect(
+			metrics
+				.split('\n')
+				.filter(line => line.startsWith(`${WORKER_SCRAPE_FAILURES}_count `)),
+		).toEqual([`${WORKER_SCRAPE_FAILURES}_count ${count}`]);
+		expect(metrics).toContain(`${WORKER_SCRAPE_FAILURES}_sum ${sum}\n`);
+		expect(metrics).toContain(
+			`${WORKER_SCRAPE_FAILURES}_bucket{le="0"} ${zeros}\n`,
+		);
+		expect(metrics.endsWith('# EOF\n')).toBe(
+			regType === Registry.OPENMETRICS_CONTENT_TYPE,
+		);
+	}
+
+	it('retains consecutive timeouts after the last worker leaves and ignores late errors', async () => {
+		const workers = [];
+		for (const id of [1, 2, 3]) workers.push(await announceWorker(id));
+
+		for (const requestId of [0, 1]) {
+			const rejection = expect(registry.workerMetrics()).rejects.toThrow(
+				`Operation timed out. ${2 - requestId} outstanding responses.`,
+			);
+			for (let index = 0; index <= requestId; index++) {
+				await workers[index].receive({
+					type: GET_METRICS_RES,
+					requestId,
+					metrics: [[]],
+				});
+			}
+			await jest.advanceTimersByTimeAsync(5_000);
+			await rejection;
+
+			await workers[2].receive({
+				type: GET_METRICS_RES,
+				requestId,
+				error: 'late failure',
+			});
+		}
+
+		for (const worker of workers) {
+			await worker.receive({ type: GOODBYE, metrics: [[]] });
+		}
+		expect(WorkerRegistry.workerCount()).toBe(0);
+		await expect(registry.workerMetrics()).resolves.toBe('');
+		const recovered = await WorkerRegistry.globalRegistry.metrics();
+		expectFailures(recovered, 2, 3);
+		expect(recovered).toContain(`${WORKER_SCRAPE_FAILURES}_bucket{le="1"} 1\n`);
+		expect(recovered).toContain(`${WORKER_SCRAPE_FAILURES}_bucket{le="2"} 2\n`);
+		expectFailures(await WorkerRegistry.globalRegistry.metrics(), 2, 3);
+	});
+
+	it.each(['worker collection failed', 'Timeout'])(
+		'records the worker error %s once without counting a waiting worker',
+		async errorMessage => {
+			const worker = await announceWorker(1);
+			const waitingWorker = await announceWorker(2);
+			const rejection = expect(registry.workerMetrics()).rejects.toThrow(
+				new Error(errorMessage),
+			);
+			const error = {
+				type: GET_METRICS_RES,
+				requestId: 0,
+				error: errorMessage,
+			};
+			await worker.receive(error);
+			await rejection;
+			await worker.receive(error);
+
+			const recovered = registry.workerMetrics();
+			await worker.receive({
+				type: GET_METRICS_RES,
+				requestId: 1,
+				metrics: [[metric(7)]],
+			});
+			await waitingWorker.receive({
+				type: GET_METRICS_RES,
+				requestId: 1,
+				metrics: [[]],
+			});
+			const metrics = await recovered;
+			expect(metrics).not.toContain(WORKER_SCRAPE_FAILURES);
+			expectFailures(await WorkerRegistry.globalRegistry.metrics(), 1, 1);
+			expect(metrics).toContain('test_metric 7\n');
+		},
+	);
+
+	it('records zero for aggregation errors without adding local metrics to worker responses', async () => {
+		const worker = await announceWorker(1);
+		const gauge = new (require('../lib/gauge'))({
+			name: 'coordinator_value',
+			help: 'test',
+		});
+		gauge.set(17);
+		const rejected = expect(registry.workerMetrics()).rejects.toThrow(
+			"'invalid' is not a defined aggregator.",
+		);
+		await worker.receive({
+			type: GET_METRICS_RES,
+			requestId: 0,
+			metrics: [[{ ...metric(7), aggregator: 'invalid' }]],
+		});
+		await rejected;
+		expectFailures(await WorkerRegistry.globalRegistry.metrics(), 1, 0, 1);
+
+		const recovered = registry.workerMetrics();
+		await worker.receive({
+			type: GET_METRICS_RES,
+			requestId: 1,
+			metrics: [[metric(7)]],
+		});
+		const metrics = await recovered;
+		expect(metrics).toContain('test_metric 7\n');
+		expect(metrics).not.toContain('coordinator_value');
+		expect(metrics).not.toContain(WORKER_SCRAPE_FAILURES);
+		expectFailures(await WorkerRegistry.globalRegistry.metrics(), 1, 0, 1);
+	});
+
+	it.each(['default', 'custom'])(
+		'reports %s registry collection errors to the parent',
+		async registryType => {
+			const MetricRegistry = require('../lib/registry');
+			const source =
+				registryType === 'default'
+					? MetricRegistry.globalRegistry
+					: new MetricRegistry();
+			WorkerRegistry.setRegistries(source);
+			jest
+				.spyOn(source, 'getMetricsAsJSON')
+				.mockRejectedValueOnce(new Error('worker collection failed'));
+			const workerChannel = channels[1];
+
+			await announcementChannel.receive({
+				type: GET_METRICS_REQ,
+				requestId: 42,
+			});
+			expect(workerChannel.postMessage).toHaveBeenLastCalledWith({
+				type: GET_METRICS_RES,
+				requestId: 42,
+				error: 'worker collection failed',
+			});
+
+			await announcementChannel.receive({
+				type: GET_METRICS_REQ,
+				requestId: 43,
+			});
+			expect(workerChannel.postMessage).toHaveBeenLastCalledWith({
+				type: GET_METRICS_RES,
+				requestId: 43,
+				threadId: 0,
+				metrics: [await source.getMetricsAsJSON()],
+			});
+			expect(
+				MetricRegistry.globalRegistry.getSingleMetric(WORKER_SCRAPE_FAILURES),
+			).toBeDefined();
+		},
+	);
 });
